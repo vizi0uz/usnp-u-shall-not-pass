@@ -1,0 +1,12 @@
+# generated / intermediate
+usnp.ps1
+# logs & backups
+*.log
+*.bak
+*.tmp
+# personal artifacts (defense-in-depth)
+hreshprime_*
+# OS cruft
+Thumbs.db
+desktop.ini
+.DS_Store

@@ -1,0 +1,412 @@
+param(
+    [string]$ExePath,
+    [string]$SearchName,
+    [string[]]$SearchRoots
+)
+
+Set-StrictMode -Off
+$ErrorActionPreference = 'Continue'
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+
+# --- Self identity (rename-safe: no literal name anywhere) --------------------
+
+$selfPath = if ($PSCommandPath) { $PSCommandPath }
+            else { [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName }
+$launcherDir = Split-Path $selfPath
+$selfBase    = [System.IO.Path]::GetFileNameWithoutExtension($selfPath)
+
+if (-not $PSBoundParameters.ContainsKey('SearchRoots') -or -not $SearchRoots) {
+    $SearchRoots = @($launcherDir)
+}
+
+# --- Embedded images (base64) ------------------------------------------------
+
+$LogoB64 = @'
+__LOGO_B64__
+'@
+$BgB64 = @'
+__BG_B64__
+'@
+
+$script:logoBmp = $null
+function Get-LogoBitmap {
+    if ($script:logoBmp) { return $script:logoBmp }
+    try {
+        $bytes = [Convert]::FromBase64String($LogoB64)
+        $ms = New-Object System.IO.MemoryStream (,$bytes)
+        $script:logoBmp = New-Object System.Drawing.Bitmap $ms
+        return $script:logoBmp
+    } catch { return $null }
+}
+
+$script:bgBmp = $null
+function Get-BgBitmap {
+    if ($script:bgBmp) { return $script:bgBmp }
+    try {
+        $bytes = [Convert]::FromBase64String($BgB64)
+        $ms = New-Object System.IO.MemoryStream (,$bytes)
+        $script:bgBmp = New-Object System.Drawing.Bitmap $ms
+        return $script:bgBmp
+    } catch { return $null }
+}
+
+# --- Log setup (named after launcher) ----------------------------------------
+
+$logFile = Join-Path $launcherDir "$selfBase.log"
+if ((Test-Path $logFile) -and (Get-Item $logFile).Length -gt 1MB) {
+    Rename-Item $logFile "$logFile.old" -Force -ErrorAction SilentlyContinue
+}
+
+function Write-Log {
+    param([string]$level, [string]$msg)
+    $line = "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] [$level] $msg"
+    Add-Content -Path $logFile -Value $line -ErrorAction SilentlyContinue
+}
+function Write-Step { param($m) Write-Log 'INFO' $m }
+function Write-OK   { param($m) Write-Log 'OK'   $m }
+function Write-Warn { param($m) Write-Log 'WARN' $m }
+function Write-Fail { param($m) Write-Log 'FAIL' $m }
+
+# --- UI state ----------------------------------------------------------------
+
+$script:sf   = $null   # main form
+$script:sl   = $null   # status label
+$script:btns = @()     # candidate buttons (Labels)
+
+function Set-Status {
+    param([string]$msg)
+    if ($script:sl) { $script:sl.Text = $msg }
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Show-ErrorDialog {
+    param([string]$msg)
+    [System.Windows.Forms.MessageBox]::Show(
+        $msg,
+        "USNP - U Shall Not Pass!",
+        [System.Windows.Forms.MessageBoxButtons]::OK,
+        [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+}
+
+function Test-IsElevated {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    return ([Security.Principal.WindowsPrincipal]$id).IsInRole(
+        [Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# --- Method 1: __COMPAT_LAYER=RunAsInvoker -----------------------------------
+
+function Invoke-Method1 {
+    param([string]$Exe, [string]$Dir)
+    Set-Status "Launching...`nMethod 1: RunAsInvoker (env var)"
+    Write-Step "Method 1: __COMPAT_LAYER=RunAsInvoker..."
+    try {
+        $env:__COMPAT_LAYER = "RunAsInvoker"
+        $proc = Start-Process -FilePath $Exe -WorkingDirectory $Dir -PassThru -ErrorAction Stop
+        Start-Sleep -Milliseconds 2000
+        if (-not $proc.HasExited) {
+            Write-OK "Method 1 SUCCESS - PID $($proc.Id)"
+            return $proc
+        }
+        Write-Warn "Method 1: exited immediately (code $($proc.ExitCode))"
+        return $null
+    } catch {
+        Write-Warn "Method 1 failed: $_"
+        return $null
+    } finally {
+        Remove-Item Env:\__COMPAT_LAYER -ErrorAction SilentlyContinue
+    }
+}
+
+# --- Method 2: Shell.Application (Explorer token) ---------------------------
+
+function Invoke-Method2 {
+    param([string]$Exe)
+    Set-Status "Launching...`nMethod 2: Explorer shell token"
+    Write-Step "Method 2: Shell.Application.ShellExecute..."
+    try {
+        $shell = New-Object -ComObject Shell.Application
+        $shell.ShellExecute($Exe, '', (Split-Path $Exe), 'open', 1)
+        Start-Sleep -Milliseconds 2500
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($Exe)
+        $proc = Get-Process -Name $name -ErrorAction SilentlyContinue |
+            Sort-Object StartTime -Descending | Select-Object -First 1
+        if ($proc) { Write-OK "Method 2 SUCCESS - PID $($proc.Id)"; return $proc }
+        Write-Warn "Method 2: process not detected after launch"
+        return $null
+    } catch {
+        Write-Warn "Method 2 failed: $_"
+        return $null
+    }
+}
+
+# --- Method 3: runas /trustlevel:0x20000 ------------------------------------
+
+function Invoke-Method3 {
+    param([string]$Exe)
+    Set-Status "Launching...`nMethod 3: runas /trustlevel:0x20000"
+    Write-Step "Method 3: runas /trustlevel:0x20000..."
+    try {
+        Start-Process "runas.exe" -ArgumentList "/trustlevel:0x20000 `"$Exe`"" `
+            -PassThru -ErrorAction Stop | Out-Null
+        Start-Sleep -Milliseconds 2500
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($Exe)
+        $proc = Get-Process -Name $name -ErrorAction SilentlyContinue |
+            Sort-Object StartTime -Descending | Select-Object -First 1
+        if ($proc) { Write-OK "Method 3 SUCCESS - PID $($proc.Id)"; return $proc }
+        Write-Warn "Method 3: process not detected"
+        return $null
+    } catch {
+        Write-Warn "Method 3 failed: $_"
+        return $null
+    }
+}
+
+# --- Method 4: PsExec -l -----------------------------------------------------
+
+function Invoke-Method4 {
+    param([string]$Exe)
+    Set-Status "Launching...`nMethod 4: PsExec limited token"
+    Write-Step "Method 4: PsExec -l..."
+    $psexecCmd = Get-Command psexec.exe -ErrorAction SilentlyContinue
+    $psexec = if ($psexecCmd) { $psexecCmd.Source } else { $null }
+    if (-not $psexec) {
+        $psexec = @(
+            "$env:USERPROFILE\Downloads\PSTools\PsExec.exe",
+            "C:\Tools\PSTools\PsExec.exe",
+            "C:\Sysinternals\PsExec.exe"
+        ) | Where-Object { Test-Path $_ } | Select-Object -First 1
+    }
+    if (-not $psexec) {
+        Write-Warn "Method 4 skipped: PsExec not found"
+        return $null
+    }
+    try {
+        Start-Process $psexec -ArgumentList "-l -d `"$Exe`"" -PassThru -ErrorAction Stop | Out-Null
+        Start-Sleep -Milliseconds 2500
+        $name = [System.IO.Path]::GetFileNameWithoutExtension($Exe)
+        $proc = Get-Process -Name $name -ErrorAction SilentlyContinue |
+            Sort-Object StartTime -Descending | Select-Object -First 1
+        if ($proc) { Write-OK "Method 4 SUCCESS - PID $($proc.Id)"; return $proc }
+        Write-Warn "Method 4: process not detected"
+        return $null
+    } catch {
+        Write-Warn "Method 4 failed: $_"
+        return $null
+    }
+}
+
+# --- Launch chain (4 escalating methods) -------------------------------------
+
+function Invoke-LaunchChain {
+    param([string]$Exe, [string]$Dir)
+    foreach ($m in @(
+        { Invoke-Method1 -Exe $Exe -Dir $Dir },
+        { Invoke-Method2 -Exe $Exe },
+        { Invoke-Method3 -Exe $Exe },
+        { Invoke-Method4 -Exe $Exe }
+    )) {
+        $r = & $m
+        if ($r) { return $r }
+    }
+    return $null
+}
+
+# --- Candidate resolution (returns a LIST) -----------------------------------
+
+function Resolve-Candidates {
+    if ($ExePath) {
+        if (-not (Test-Path $ExePath)) {
+            Show-ErrorDialog "Provided path not found:`n$ExePath"
+            return @()
+        }
+        $full = (Resolve-Path $ExePath).Path
+        return ,([pscustomobject]@{ Name = [System.IO.Path]::GetFileName($full); FullName = $full })
+    }
+
+    if ($SearchName) {
+        $running = Get-Process -ErrorAction SilentlyContinue | Where-Object {
+            $_.Path -and $_.Name -match [regex]::Escape($SearchName)
+        } | Select-Object -First 1
+        if ($running -and $running.Path) {
+            return ,([pscustomobject]@{ Name = [System.IO.Path]::GetFileName($running.Path); FullName = $running.Path })
+        }
+    }
+
+    $cands = @()
+    foreach ($root in $SearchRoots) {
+        if (-not (Test-Path $root)) { continue }
+        $pattern = if ($SearchName) { "*$SearchName*.exe" } else { "*.exe" }
+        try {
+            $found = Get-ChildItem -Path $root -Filter $pattern -Recurse -Depth 3 `
+                -ErrorAction SilentlyContinue -Force |
+                Where-Object { -not $_.PSIsContainer } |
+                Sort-Object LastWriteTime -Descending
+            $cands += $found
+        } catch {}
+    }
+
+    # Dedupe by FullName (preserve LastWriteTime order)
+    $seen = @{}
+    $cands = $cands | Where-Object {
+        if ($seen[$_.FullName]) { $false } else { $seen[$_.FullName] = $true; $true }
+    }
+
+    # Never target the launcher itself (rename-safe: matches runtime self path/name)
+    $cands = $cands | Where-Object {
+        $_.FullName -ne $selfPath -and $_.BaseName -ne $selfBase
+    }
+
+    return @($cands | Select-Object -First 6 | ForEach-Object {
+        [pscustomobject]@{ Name = $_.Name; FullName = $_.FullName }
+    })
+}
+
+# --- Button click: launch ONLY on click --------------------------------------
+
+function Invoke-CandidateClick {
+    param($btn)
+    $path = $btn.Tag
+    if (-not $path) { return }
+    $name = [System.IO.Path]::GetFileName($path)
+
+    foreach ($b in $script:btns) {
+        $b.Enabled   = $false
+        $b.BackColor = [System.Drawing.Color]::FromArgb(120, 40, 40, 48)
+        $b.ForeColor = [System.Drawing.Color]::Silver
+    }
+
+    Write-OK "Target: $path"
+    if (Test-IsElevated) { Write-Warn "Launcher elevated - non-admin launch less reliable." }
+    Set-Status "Launching $name ...`nMethod 1: RunAsInvoker"
+
+    $dir    = Split-Path $path
+    $result = Invoke-LaunchChain -Exe $path -Dir $dir
+
+    if ($result) {
+        Set-Status "Running: $name  (PID $($result.Id))  -  closing..."
+        Write-Log 'OK' "=== Launch success - $name PID $($result.Id) ==="
+        $t = New-Object System.Windows.Forms.Timer
+        $t.Interval = 1400
+        $t.Add_Tick({ $this.Stop(); if ($script:sf) { $script:sf.Close() } })
+        $t.Start()
+    } else {
+        Write-Log 'FAIL' "=== All methods failed - $name ==="
+        Set-Status "All methods failed. Pick again, or run as a standard user."
+        Show-ErrorDialog "All 4 methods failed for:`n$name`n`nRun as a standard (non-admin) user.`n`nManual fix:`n  `$env:__COMPAT_LAYER = 'RunAsInvoker'`n  & `"$path`"`n`nLog: $logFile"
+        foreach ($b in $script:btns) {
+            $b.Enabled   = $true
+            $b.ForeColor = [System.Drawing.Color]::White
+            $b.BackColor = [System.Drawing.Color]::FromArgb(178, 30, 30, 38)
+        }
+    }
+}
+
+# --- Main window -------------------------------------------------------------
+
+function Show-MainWindow {
+    param($cands)
+
+    $btnTop = 58
+    $btnH   = 40
+    $btnGap = 8
+    $rows   = @($cands).Count
+    $listH  = $rows * ($btnH + $btnGap)
+    $m       = 20
+    $clientW = 512
+    $clientH = 512
+
+    $f = New-Object System.Windows.Forms.Form
+    $f.Text            = "USNP - U Shall Not Pass!"
+    $f.StartPosition   = "CenterScreen"
+    $f.FormBorderStyle = "Sizable"
+    $f.MaximizeBox     = $true
+    $f.MinimizeBox     = $true
+    $f.TopMost         = $true
+    $f.ClientSize      = New-Object System.Drawing.Size($clientW, $clientH)
+    $f.MinimumSize     = New-Object System.Drawing.Size(420, ($btnTop + $listH + 140))
+    $f.BackColor       = [System.Drawing.Color]::FromArgb(24, 24, 28)
+
+    $bg = Get-BgBitmap
+    if ($bg) {
+        $f.BackgroundImage       = $bg
+        $f.BackgroundImageLayout = [System.Windows.Forms.ImageLayout]::Stretch
+    }
+    $logo = Get-LogoBitmap
+    if ($logo) { try { $f.Icon = [System.Drawing.Icon]::FromHandle($logo.GetHicon()) } catch {} }
+
+    # Title strip (semi-opaque for readability over art)
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text      = "Pick an app to launch (admin elevation stripped)"
+    $title.Font      = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = [System.Drawing.Color]::White
+    $title.BackColor = [System.Drawing.Color]::FromArgb(150, 0, 0, 0)
+    $title.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $title.Location  = New-Object System.Drawing.Point($m, 14)
+    $title.Size      = New-Object System.Drawing.Size(($clientW - 2*$m), 32)
+    $title.Anchor    = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $f.Controls.Add($title)
+
+    # Status strip (bottom)
+    $slY = $clientH - 42
+    $sl = New-Object System.Windows.Forms.Label
+    $sl.Text      = "Ready."
+    $sl.Font      = New-Object System.Drawing.Font("Segoe UI", 9)
+    $sl.ForeColor = [System.Drawing.Color]::Gainsboro
+    $sl.BackColor = [System.Drawing.Color]::FromArgb(150, 0, 0, 0)
+    $sl.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $sl.Location  = New-Object System.Drawing.Point($m, $slY)
+    $sl.Size      = New-Object System.Drawing.Size(($clientW - 2*$m), 34)
+    $sl.Anchor    = [System.Windows.Forms.AnchorStyles]::Bottom -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+    $f.Controls.Add($sl)
+
+    $script:sf   = $f
+    $script:sl   = $sl
+    $script:btns = @()
+
+    # One clickable Label-button per candidate (70% opaque overlay -> art shows through)
+    $i = 0
+    foreach ($c in $cands) {
+        $y = $btnTop + ($i * ($btnH + $btnGap))
+        $b = New-Object System.Windows.Forms.Label
+        $b.Text        = $c.Name
+        $b.Tag         = $c.FullName
+        $b.AutoSize    = $false
+        $b.Location    = New-Object System.Drawing.Point(30, $y)
+        $b.Size        = New-Object System.Drawing.Size(($clientW - 60), $btnH)
+        $b.Anchor      = [System.Windows.Forms.AnchorStyles]::Top -bor [System.Windows.Forms.AnchorStyles]::Left -bor [System.Windows.Forms.AnchorStyles]::Right
+        $b.TextAlign   = [System.Drawing.ContentAlignment]::MiddleCenter
+        $b.Font        = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+        $b.ForeColor   = [System.Drawing.Color]::White
+        $b.BackColor   = [System.Drawing.Color]::FromArgb(178, 30, 30, 38)
+        $b.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+        $b.Cursor      = [System.Windows.Forms.Cursors]::Hand
+        $b.Add_MouseEnter({ if ($this.Enabled) { $this.BackColor = [System.Drawing.Color]::FromArgb(210, 55, 55, 70) } })
+        $b.Add_MouseLeave({ if ($this.Enabled) { $this.BackColor = [System.Drawing.Color]::FromArgb(178, 30, 30, 38) } })
+        $b.Add_Click({ Invoke-CandidateClick $this })
+        $f.Controls.Add($b)
+        $b.BringToFront()
+        $script:btns += $b
+        $i++
+    }
+    $title.BringToFront()
+    $sl.BringToFront()
+
+    [System.Windows.Forms.Application]::Run($f)
+}
+
+# --- Entry -------------------------------------------------------------------
+
+# Test hook: when USNP_NORUN is set, define functions only (no resolve/UI). Inert in normal use.
+if ($env:USNP_NORUN) { return }
+
+Write-Step "USNP start (root: $($SearchRoots -join '; '))"
+$cands = Resolve-Candidates
+if (-not $cands -or @($cands).Count -eq 0) {
+    Show-ErrorDialog "No executable found in:`n$($SearchRoots -join "`n")`n`nDrop USNP next to the app, or use -ExePath / -SearchName.`n`nLog: $logFile"
+    exit 1
+}
+Write-Step "Found $(@($cands).Count) candidate(s)."
+Show-MainWindow $cands
