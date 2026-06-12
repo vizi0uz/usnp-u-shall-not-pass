@@ -1,3 +1,5 @@
+<img width="1254" height="1254" alt="launcher-logo" src="https://github.com/user-attachments/assets/c50c8d2f-9031-4582-89ea-45277a7187ef" />
+
 # USNP — U Shall Not Pass!
 
 **A zero-elevation app launcher. Drop it next to any application that nags for admin rights—USNP strips the prompt and runs it clean.**
