@@ -1,4 +1,4 @@
-<img width="1254" height="1254" alt="launcher-logo" src="https://github.com/user-attachments/assets/c50c8d2f-9031-4582-89ea-45277a7187ef" />
+<img width="1672" height="941" alt="cb2d2013-3e64-43a2-a264-7f193d6ee046" src="https://github.com/user-attachments/assets/8fcd4955-b505-4a96-863a-0ab7b8dfebb7" />
 
 # USNP — U Shall Not Pass!
 
